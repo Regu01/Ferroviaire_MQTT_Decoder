@@ -1,186 +1,96 @@
-#include <Arduino.h>
-#include <AceWire.h>
-#include "./functions/PCAL9535A.h"
-#include "./functions/TrafficLight.h"
+/**
+   A trivial C/MRI -> JMRI interface
+   =================================
+   Sets up pin 13 (LED) as an output, and attaches it to the first output bit
+   of the emulated SMINI interface.
 
+   To set up in JMRI:
+   1: Create a new connection,
+      - type = C/MRI,
+      - connection = Serial,
+      - port = <arduino's port>,
+      - speed = 9600
+   2: Click 'Configure C/MRI nodes' and create a new SMINI node
+   3: Click 'Add Node' and then 'Done'
+   4: Restart J/MRI and it should say "Serial: using Serial on COM<x>" - congratulations!
+   5: Open Tools > Tables > Lights and click 'Add'
+   6: Add a new light at hardware address 1, then click 'Create' and close the window. Ignore the save message.
+   7: Click the 'Off' state button to turn the LED on. Congratulations!
 
-///////////////////////////////////////
-///// GESTION RETROSIGNIALISATION /////
-///////////////////////////////////////
+   Debugging:
+   Open the CMRI > CMRI Monitor window to check what is getting sent.
+   With 'Show raw data' turned on the output looks like:
+      [41 54 01 00 00 00 00 00]  Transmit ua=0 OB=1 0 0 0 0 0
 
-using ace_wire::SimpleWireInterface;
+   0x41 = 65 = A = address 0
+   0x54 = 84 = T = transmit, i.e. PC -> C/MRI
+   0x01 = 0b00000001 = turn on the 1st bit
+   0x00 = 0b00000000 = all other bits off
+*/
 
-constexpr int PIN_SDA = 21;
-constexpr int PIN_SCL = 22;
-constexpr uint8_t DELAY_MICROS = 1;
+#include "CMRI.h"
+#include <WiFi.h>
 
-// Create the AceWire SimpleWireInterface
-SimpleWireInterface wire(PIN_SDA, PIN_SCL, DELAY_MICROS);
+#define TCP_PORT 9007
+#define LED_BUILTIN 2
 
-// Create PCAL9535A instance with reference to SimpleWireInterface
-PCAL9535A::PCAL9535A<SimpleWireInterface> gpio1(wire);
-PCAL9535A::PCAL9535A<SimpleWireInterface> gpio2(wire);
-PCAL9535A::PCAL9535A<SimpleWireInterface> gpio3(wire);
-PCAL9535A::PCAL9535A<SimpleWireInterface> gpio4(wire);
+const char* ssid = "PEYON-Sebastien";
+const char* password =  "12688323820980798656";
 
-// Configuration des broches pour chaque couleur et GPIO associées
-const TrafficLight::GpioColors trafficLight1Pins{
-    gpio1, // GPIO pour la couleur rouge
-    gpio1, // GPIO pour la couleur jaune
-    gpio1, // GPIO pour la couleur verte
-    {6, 7, 2} // Broches pour chaque couleur (Rouge, Jaune, Vert)
-};
+WiFiServer wifiServer(TCP_PORT);
+WiFiClient jmriClient;
 
-const TrafficLight::GpioColors trafficLight11Pins{
-    gpio2, // GPIO pour la couleur rouge
-    gpio2, // GPIO pour la couleur jaune
-    gpio3, // GPIO pour la couleur verte
-    {1, 0, 12} // Broches pour chaque couleur (Rouge, Jaune, Vert)
-};
+CMRI cmri(1, 64, 64, jmriClient); // node number, number of inputs, number of outputs, strean client
 
-// Créez les instances TrafficLight correspondantes
-TrafficLight trafficLight1(trafficLight1Pins);
-TrafficLight trafficLight11(trafficLight11Pins);
-// TrafficLight trafficLight1(trafficLight1Pins);
-// TrafficLight trafficLight2(trafficLight2Pins);
-// TrafficLight trafficLight3(trafficLight3Pins);
-// TrafficLight trafficLight4(trafficLight4Pins);
-// TrafficLight trafficLight5(trafficLight5Pins);
-// TrafficLight trafficLight6(trafficLight6Pins);
-// TrafficLight trafficLight7(trafficLight7Pins);
-// TrafficLight trafficLight8(trafficLight8Pins);
-// TrafficLight trafficLight9(trafficLight9Pins);
-// TrafficLight trafficLight10(trafficLight10Pins);
-// TrafficLight trafficLight11(trafficLight11Pins);
-// TrafficLight trafficLight12(trafficLight12Pins);
-
-
-
-////////////////////////////
-///// DECTECTION TRAIN /////
-////////////////////////////
-
-// Déclarations des fonctions
-const int inputPins[] = {34, 35, 32, 33, 25, 26, 27, 14, 17, 13, 4};
-const int numPins = sizeof(inputPins) / sizeof(inputPins[0]);
-bool currentStates[numPins];
-
-unsigned long iterationCounter = 0;
-bool initialized = false;
-int previousStates[11];
-
-
-
-//////////////////////////
-///// FUNCTION TRAIN /////
-//////////////////////////
-void initializePreviousStates() {
-  for (int i = 0; i < numPins; i++) {
-    previousStates[i] = digitalRead(inputPins[i]);
-  }
-  initialized = true;
-}
-
-void printPinStatesHeader() {
-  Serial.print("| ");
-  for (int i = 0; i < numPins; i++) {
-    Serial.print("IO");
-    Serial.print(inputPins[i]);
-    Serial.print(" | ");
-  }
-  Serial.println();
-}
-
-void printPinStates(bool states[]) {
-  Serial.print("| ");
-  for (int i = 0; i < numPins; i++) {
-    states[i] = (digitalRead(inputPins[i]) == HIGH);
-    Serial.print(states[i] ? "HIGH" : "LOW");
-    Serial.print(" | ");
-  }
-  Serial.println();
-}
-
-bool pinStatesChanged(bool states[]) {
-  bool statesChanged = false;
-
-  for (int i = 0; i < numPins; i++) {
-    if (states[i] != (digitalRead(inputPins[i]) == HIGH)) {
-      states[i] = !states[i];
-      statesChanged = true;
-    }
-  }
-  return statesChanged;
-}
-
-
-
-///////////////////////////
-///// SETUP PROGRAMME /////
-///////////////////////////
 void setup() {
-  // Serial Begin
-  Serial.begin(9600);
-  Serial.println("Hello World");
-  delay(100);
+  Serial.begin(9600); //Just for debug console feedback, not CMRI connection
+  delay(1000);
 
-  //Init GPIO
-  gpio1.begin(PCAL9535A::HardwareAddress::A000);  // 0x20 - Pins = 000  => Puce N°1
-  gpio2.begin(PCAL9535A::HardwareAddress::A001);  // 0x21 - Pins = 001  => Puce N°2
-  gpio3.begin(PCAL9535A::HardwareAddress::A010);  // 0x22 - Pins = 010  => Puce N°3
-  gpio4.begin(PCAL9535A::HardwareAddress::A011);  // 0x23 - Pins = 011  => Puce N°4
-  Serial.println("GPIO INIT");
-  delay(100);
+  WiFi.begin(ssid, password);
 
-  // Initialisation des feux de signalisation
-  trafficLight1.init();
-  trafficLight11.init();
-  // trafficLight1.init();
-  // trafficLight2.init();
-  // trafficLight3.init();
-  // trafficLight4.init();
-  // trafficLight5.init();
-  // trafficLight6.init();
-  // trafficLight7.init();
-  // trafficLight8.init();
-  // trafficLight9.init();
-  // trafficLight10.init();
-  // trafficLight11.init();
-  // trafficLight12.init();
-  Serial.println("trafficLight INIT");
-  delay(100);
-
-  // Initialisation des detecteurs de courant
-  for (int i = 0; i < numPins; i++) {
-    pinMode(inputPins[i], INPUT);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi..");
   }
-  Serial.println("detecteurs de courant INIT");
-  delay(100);
 
+  Serial.println("Connected to the WiFi network");
+  Serial.println(WiFi.localIP());
 
-  Serial.println("---------------------------");
-  Serial.println("Setup Finish");
-  Serial.println("---------------------------");
-  delay(100);
+  wifiServer.begin();
+  delay(1000);
+
+  pinMode(23, INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(12, OUTPUT);
 }
 
 void loop() {
-
-  if (!initialized) {
-    initializePreviousStates();
-    printPinStatesHeader();
-  }
-
-  delay(100);
-
-  if (pinStatesChanged(currentStates)) {
-    printPinStates(currentStates);
-    if (currentStates[0] == 1) {
-      trafficLight1.turnOnGreen();
-    } else {
-      trafficLight1.turnOnRed();
+  // 1: main processing node of cmri library
+  
+  bool jmriConnected = jmriClient.connected();
+  while (!jmriConnected) {
+    jmriClient = wifiServer.available();
+    if (jmriClient && jmriClient.connected()) {
+      jmriConnected = true;
+      Serial.println("JMRI Connected");
     }
-    // Utilisez le tableau currentStates comme nécessaire après chaque changement d'état
   }
 
+  cmri.set_bit(0, digitalRead(23));
+
+  cmri.process();
+
+
+  // 2: update output. Reads bit 0 of T packet and sets the LED to this
+  int led = cmri.get_bit(0);
+  //Serial.println("LED state "+String(led));
+  // if (led == 0) {
+  //   digitalWrite(LED_BUILTIN, LOW);
+  //   digitalWrite(12, LOW);
+  // }
+
+  // else {
+  //   digitalWrite(LED_BUILTIN, HIGH);
+  //   digitalWrite(12, HIGH);
+  // }
 }
